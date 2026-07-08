@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from unittest.mock import MagicMock
+import uuid
 
 from google.adk.events.event import Event
 from google.adk.memory.memory_entry import MemoryEntry
@@ -90,8 +92,17 @@ def embedding_function(texts):
   return [[float(index + 1), 0.0, 0.0] for index, _ in enumerate(texts)]
 
 
-async def async_embedding_function(texts):
-  return embedding_function(texts)
+def keyword_embedding_function(texts):
+  vectors = []
+  for text in texts:
+    lowered = text.lower()
+    if "milvus" in lowered or "vector" in lowered or "semantic" in lowered:
+      vectors.append([1.0, 0.0, 0.0])
+    elif "cooking" in lowered or "pasta" in lowered:
+      vectors.append([0.0, 1.0, 0.0])
+    else:
+      vectors.append([0.0, 0.0, 1.0])
+  return vectors
 
 
 def create_service(fake_milvus, **kwargs):
@@ -102,6 +113,26 @@ def create_service(fake_milvus, **kwargs):
       uri="memory.db",
       **kwargs,
   )
+
+
+def create_lite_config(tmp_path: Path, **kwargs):
+  return MilvusMemoryServiceConfig(
+      uri=str(tmp_path / "milvus_memory_unit.db"),
+      collection_name=f"memory_collection_{uuid.uuid4().hex[:8]}",
+      dimension=3,
+      consistency_level="Strong",
+      **kwargs,
+  )
+
+
+async def close_lite_service(service):
+  try:
+    service._client.drop_collection(  # pylint: disable=protected-access
+        collection_name=service._config.collection_name  # pylint: disable=protected-access
+    )
+  except Exception:
+    pass
+  await service.close()
 
 
 def test_constructor_creates_collection(fake_milvus):
@@ -261,9 +292,13 @@ def test_duplicate_field_name_raises(fake_milvus):
 
 
 @pytest.mark.asyncio
-async def test_add_session_to_memory_upserts_text_events(fake_milvus):
-  client, _, _ = fake_milvus
-  service = create_service(fake_milvus)
+async def test_add_session_to_memory_persists_text_events_with_milvus_lite(
+    tmp_path: Path,
+):
+  service = MilvusMemoryService(
+      embedding_function=keyword_embedding_function,
+      config=create_lite_config(tmp_path),
+  )
   session = Session(
       app_name="test-app",
       user_id="test-user",
@@ -304,24 +339,30 @@ async def test_add_session_to_memory_upserts_text_events(fake_milvus):
       ],
   )
 
-  await service.add_session_to_memory(session)
+  try:
+    await service.add_session_to_memory(session)
+    result = await service.search_memory(
+        app_name="test-app",
+        user_id="test-user",
+        query="semantic vector memory",
+    )
 
-  client.upsert.assert_called_once()
-  records = client.upsert.call_args.kwargs["data"]
-  assert len(records) == 2
-  assert records[0]["app_name"] == "test-app"
-  assert records[0]["user_id"] == "test-user"
-  assert records[0]["session_id"] == "session-1"
-  assert records[0]["event_id"] == "event-1"
-  assert records[0]["source"] == "adk_event"
-  assert records[0]["metadata"]["invocation_id"] == "inv-1"
-  assert records[1]["embedding"] == [2.0, 0.0, 0.0]
+    texts = [memory.content.parts[0].text for memory in result.memories]
+    assert "Milvus stores vectors." in texts
+    assert "Semantic search is supported." in texts
+    assert "lookup" not in " ".join(texts)
+  finally:
+    await close_lite_service(service)
 
 
 @pytest.mark.asyncio
-async def test_add_memory_upserts_direct_memory(fake_milvus):
-  client, _, _ = fake_milvus
-  service = create_service(fake_milvus)
+async def test_add_memory_persists_direct_memory_with_milvus_lite(
+    tmp_path: Path,
+):
+  service = MilvusMemoryService(
+      embedding_function=keyword_embedding_function,
+      config=create_lite_config(tmp_path),
+  )
   memory = MemoryEntry(
       id="memory-1",
       author="user",
@@ -330,68 +371,74 @@ async def test_add_memory_upserts_direct_memory(fake_milvus):
       custom_metadata={"kind": "fact"},
   )
 
-  await service.add_memory(
-      app_name="test-app",
-      user_id="test-user",
-      memories=[memory],
-      custom_metadata={"source_name": "manual"},
-  )
+  try:
+    await service.add_memory(
+        app_name="test-app",
+        user_id="test-user",
+        memories=[memory],
+        custom_metadata={"source_name": "manual"},
+    )
+    result = await service.search_memory(
+        app_name="test-app",
+        user_id="test-user",
+        query="Milvus fact",
+    )
 
-  records = client.upsert.call_args.kwargs["data"]
-  assert records == [{
-      "id": "memory-1",
-      "embedding": [1.0, 0.0, 0.0],
-      "text": "Remember Milvus.",
-      "app_name": "test-app",
-      "user_id": "test-user",
-      "session_id": "",
-      "event_id": "",
-      "author": "user",
-      "timestamp": "2026-01-01T00:00:00Z",
-      "source": "adk_memory",
-      "metadata": {
-          "source_name": "manual",
-          "kind": "fact",
-          "source": "adk_memory",
-      },
-  }]
+    assert len(result.memories) == 1
+    assert result.memories[0].content.parts[0].text == "Remember Milvus."
+    assert result.memories[0].custom_metadata == {
+        "source_name": "manual",
+        "kind": "fact",
+        "source": "adk_memory",
+    }
+  finally:
+    await close_lite_service(service)
 
 
 @pytest.mark.asyncio
-async def test_search_memory_returns_entries(fake_milvus):
-  client, _, _ = fake_milvus
+async def test_search_memory_returns_scoped_entries_with_milvus_lite(
+    tmp_path: Path,
+):
   service = MilvusMemoryService(
-      embedding_function=async_embedding_function,
-      dimension=3,
-      uri="memory.db",
-      search_top_k=3,
+      embedding_function=keyword_embedding_function,
+      config=create_lite_config(tmp_path, search_top_k=3),
   )
-  client.search.return_value = [[{
-      "entity": {
-          "text": "Milvus supports semantic memory.",
-          "author": "user",
-          "timestamp": "2026-01-01T00:00:00Z",
-          "metadata": {"source": "adk_event"},
-      }
-  }]]
-
-  result = await service.search_memory(
-      app_name='app "quoted"',
-      user_id="user-1",
-      query="semantic memory",
+  memory = MemoryEntry(
+      id="memory-quoted-app",
+      author="user",
+      timestamp="2026-01-01T00:00:00Z",
+      content=types.Content(
+          parts=[types.Part(text="Milvus supports semantic memory.")]
+      ),
+      custom_metadata={"source": "adk_event"},
   )
 
-  assert len(result.memories) == 1
-  assert result.memories[0].content.parts[0].text == (
-      "Milvus supports semantic memory."
-  )
-  assert result.memories[0].custom_metadata == {"source": "adk_event"}
-  search_kwargs = client.search.call_args.kwargs
-  assert search_kwargs["filter"] == (
-      'app_name == "app \\"quoted\\"" and user_id == "user-1"'
-  )
-  assert search_kwargs["limit"] == 3
-  assert search_kwargs["data"] == [[1.0, 0.0, 0.0]]
+  try:
+    await service.add_memory(
+        app_name='app "quoted"',
+        user_id="user-1",
+        memories=[memory],
+    )
+
+    result = await service.search_memory(
+        app_name='app "quoted"',
+        user_id="user-1",
+        query="semantic memory",
+    )
+    isolated_result = await service.search_memory(
+        app_name='app "quoted"',
+        user_id="user-2",
+        query="semantic memory",
+    )
+
+    assert len(result.memories) == 1
+    assert result.memories[0].content.parts[0].text == (
+        "Milvus supports semantic memory."
+    )
+    assert result.memories[0].custom_metadata == {"source": "adk_memory"}
+    assert isolated_result.memories == []
+  finally:
+    await close_lite_service(service)
 
 
 @pytest.mark.asyncio

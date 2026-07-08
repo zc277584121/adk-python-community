@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from unittest.mock import MagicMock
+import uuid
 
 import pytest
 
@@ -86,8 +88,21 @@ def embedding_function(texts):
   return [[float(index + 1), 0.0, 0.0] for index, _ in enumerate(texts)]
 
 
-async def async_embedding_function(texts):
-  return embedding_function(texts)
+def keyword_embedding_function(texts):
+  vectors = []
+  for text in texts:
+    lowered = text.lower()
+    if "milvus" in lowered or "vector" in lowered:
+      vectors.append([1.0, 0.0, 0.0])
+    elif "adk" in lowered or "tool" in lowered:
+      vectors.append([0.0, 1.0, 0.0])
+    else:
+      vectors.append([0.0, 0.0, 1.0])
+  return vectors
+
+
+async def async_keyword_embedding_function(texts):
+  return keyword_embedding_function(texts)
 
 
 def create_settings(**kwargs):
@@ -97,6 +112,26 @@ def create_settings(**kwargs):
       dimension=3,
       **kwargs,
   )
+
+
+def create_lite_settings(tmp_path: Path, **kwargs):
+  return MilvusVectorStoreSettings(
+      uri=str(tmp_path / "milvus_toolset_unit.db"),
+      collection_name=f"rag_collection_{uuid.uuid4().hex[:8]}",
+      dimension=3,
+      consistency_level="Strong",
+      **kwargs,
+  )
+
+
+def close_lite_vector_store(vector_store):
+  try:
+    vector_store._client.drop_collection(  # pylint: disable=protected-access
+        collection_name=vector_store._settings.collection_name  # pylint: disable=protected-access
+    )
+  except Exception:
+    pass
+  vector_store._client.close()  # pylint: disable=protected-access
 
 
 def create_vector_store(fake_milvus, **kwargs):
@@ -152,30 +187,30 @@ def test_invalid_field_name_raises(fake_milvus):
     )
 
 
-def test_add_texts_upserts_records(fake_milvus):
-  client = fake_milvus
-  vector_store = create_vector_store(fake_milvus)
-
-  result = vector_store.add_texts(
-      ["Milvus stores vectors.", "ADK tools retrieve context."],
-      metadatas=[
-          {"source": "doc-1", "section": 1},
-          {"source": "doc-2", "section": 2},
-      ],
-      ids=["id-1", "id-2"],
+def test_add_texts_persists_records_with_milvus_lite(tmp_path: Path):
+  vector_store = MilvusVectorStore(
+      embedding_function=keyword_embedding_function,
+      settings=create_lite_settings(tmp_path),
   )
 
-  assert result == {"status": "SUCCESS", "inserted_count": 2}
-  client.upsert.assert_called_once()
-  records = client.upsert.call_args.kwargs["data"]
-  assert records[0] == {
-      "id": "id-1",
-      "embedding": [1.0, 0.0, 0.0],
-      "content": "Milvus stores vectors.",
-      "source": "doc-1",
-      "metadata": {"source": "doc-1", "section": 1},
-  }
-  assert records[1]["embedding"] == [2.0, 0.0, 0.0]
+  try:
+    result = vector_store.add_texts(
+        ["Milvus stores vectors.", "ADK tools retrieve context."],
+        metadatas=[
+            {"source": "doc-1", "section": 1},
+            {"source": "doc-2", "section": 2},
+        ],
+        ids=["id-1", "id-2"],
+    )
+
+    assert result == {"status": "SUCCESS", "inserted_count": 2}
+    rows = vector_store.similarity_search("vector database", top_k=2)["rows"]
+    assert rows[0]["id"] == "id-1"
+    assert rows[0]["content"] == "Milvus stores vectors."
+    assert rows[0]["source"] == "doc-1"
+    assert rows[0]["metadata"] == {"source": "doc-1", "section": 1}
+  finally:
+    close_lite_vector_store(vector_store)
 
 
 def test_add_texts_metadata_length_mismatch_raises(fake_milvus):
@@ -185,66 +220,64 @@ def test_add_texts_metadata_length_mismatch_raises(fake_milvus):
     vector_store.add_texts(["one", "two"], metadatas=[{}])
 
 
-def test_similarity_search_returns_rows(fake_milvus):
-  client = fake_milvus
-  vector_store = create_vector_store(fake_milvus, search_top_k=3)
-  client.search.return_value = [[{
-      "id": "id-1",
-      "distance": 0.12,
-      "entity": {
-          "content": "Milvus stores vectors.",
-          "source": "doc-1",
-          "metadata": {"section": 1},
-      },
-  }]]
+def test_similarity_search_returns_rows_with_milvus_lite(tmp_path: Path):
+  vector_store = MilvusVectorStore(
+      embedding_function=keyword_embedding_function,
+      settings=create_lite_settings(tmp_path, search_top_k=1),
+  )
 
-  result = vector_store.similarity_search("vector database")
+  try:
+    vector_store.add_texts(
+        ["Milvus stores vectors.", "ADK tools retrieve context."],
+        metadatas=[
+            {"source": "doc-1", "section": 1},
+            {"source": "doc-2", "section": 2},
+        ],
+        ids=["id-1", "id-2"],
+    )
 
-  assert result == {
-      "status": "SUCCESS",
-      "rows": [{
-          "id": "id-1",
-          "content": "Milvus stores vectors.",
-          "source": "doc-1",
-          "metadata": {"section": 1},
-          "distance": 0.12,
-      }],
-  }
-  search_kwargs = client.search.call_args.kwargs
-  assert search_kwargs["collection_name"] == "rag_collection"
-  assert search_kwargs["data"] == [[1.0, 0.0, 0.0]]
-  assert search_kwargs["limit"] == 3
-  assert "filter" not in search_kwargs
+    result = vector_store.similarity_search("vector database")
+
+    assert result["status"] == "SUCCESS"
+    assert result["rows"] == [{
+        "id": "id-1",
+        "content": "Milvus stores vectors.",
+        "source": "doc-1",
+        "metadata": {"source": "doc-1", "section": 1},
+        "distance": pytest.approx(0.0, abs=1e-6),
+    }]
+  finally:
+    close_lite_vector_store(vector_store)
 
 
 @pytest.mark.asyncio
-async def test_toolset_returns_prefixed_similarity_search_tool(fake_milvus):
-  client = fake_milvus
-  client.search.return_value = [[{
-      "id": "id-1",
-      "distance": 0.12,
-      "entity": {
-          "content": "Milvus stores vectors.",
-          "source": "doc-1",
-          "metadata": {},
-      },
-  }]]
+async def test_toolset_returns_prefixed_similarity_search_tool(tmp_path: Path):
   toolset = MilvusToolset(
-      embedding_function=async_embedding_function,
+      embedding_function=async_keyword_embedding_function,
       milvus_tool_settings=MilvusToolSettings(
-          vector_store_settings=create_settings()
+          vector_store_settings=create_lite_settings(tmp_path)
       ),
   )
 
-  tools = await toolset.get_tools_with_prefix()
+  try:
+    await toolset._vector_store.add_texts_async(  # pylint: disable=protected-access
+        ["Milvus stores vectors."],
+        metadatas=[{"source": "doc-1"}],
+        ids=["id-1"],
+    )
+    tools = await toolset.get_tools_with_prefix()
 
-  assert [tool.name for tool in tools] == ["milvus_similarity_search"]
-  result = await tools[0].run_async(
-      args={"query": "vector database"},
-      tool_context=None,
-  )
-  assert result["status"] == "SUCCESS"
-  assert result["rows"][0]["content"] == "Milvus stores vectors."
+    assert [tool.name for tool in tools] == ["milvus_similarity_search"]
+    result = await tools[0].run_async(
+        args={"query": "vector database"},
+        tool_context=None,
+    )
+    assert result["status"] == "SUCCESS"
+    assert result["rows"][0]["content"] == "Milvus stores vectors."
+  finally:
+    close_lite_vector_store(  # pylint: disable=protected-access
+        toolset._vector_store
+    )
 
 
 @pytest.mark.asyncio
