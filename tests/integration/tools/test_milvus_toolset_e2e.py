@@ -159,10 +159,6 @@ async def _run_toolset_e2e(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    os.getenv("RUN_MILVUS_LITE_E2E") != "1",
-    reason="Set RUN_MILVUS_LITE_E2E=1 to run Milvus Lite E2E.",
-)
 async def test_milvus_lite_toolset_e2e(tmp_path: Path):
   await _run_toolset_e2e(
       _lite_settings(tmp_path, dimension=len(_VOCAB)),

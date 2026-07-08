@@ -188,10 +188,6 @@ def _zilliz_config(*, dimension: int) -> MilvusMemoryServiceConfig:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    os.getenv("RUN_MILVUS_LITE_E2E") != "1",
-    reason="Set RUN_MILVUS_LITE_E2E=1 to run Milvus Lite E2E.",
-)
 async def test_milvus_lite_memory_e2e(tmp_path: Path):
   await _run_memory_e2e(
       _lite_config(tmp_path, dimension=len(_VOCAB)),

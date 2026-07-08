@@ -31,10 +31,12 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           # Install dependencies as recommended in CONTRIBUTING.md
-          uv sync --extra test
+          uv sync --extra test --extra milvus
 
       - name: Run unit tests with pytest
         run: |
           source .venv/bin/activate
-          # Run all tests in the tests/unittests directory
-          pytest tests/unittests
+          # Run unit tests plus deterministic Milvus Lite coverage.
+          pytest tests/unittests \
+            tests/integration/memory/test_milvus_memory_service_e2e.py::test_milvus_lite_memory_e2e \
+            tests/integration/tools/test_milvus_toolset_e2e.py::test_milvus_lite_toolset_e2e
